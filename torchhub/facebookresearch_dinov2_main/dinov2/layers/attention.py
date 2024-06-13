@@ -85,7 +85,7 @@ class CrossAttention(nn.Module):
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
         B, N, C = x.shape
         query = self.query(x).reshape(B, N, 1, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        key_value = self.qkv(y).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        key_value = self.key_value(y).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
         q, k, v = query[0] * self.scale, key_value[0], key_value[1]
         attn = q @ k.transpose(-2, -1)

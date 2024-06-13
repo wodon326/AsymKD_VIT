@@ -126,7 +126,8 @@ class CrossAttentionBlock(nn.Module):
     ) -> None:
         super().__init__()
         # print(f"biases: qkv: {qkv_bias}, proj: {proj_bias}, ffn: {ffn_bias}")
-        self.norm1 = norm_layer(dim)
+        self.norm1_x = norm_layer(dim)
+        self.norm1_y = norm_layer(dim)
         self.attn = attn_class(
             dim,
             num_heads=num_heads,
@@ -152,17 +153,17 @@ class CrossAttentionBlock(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor) -> Tensor:
-        def attn_residual_func(x: Tensor) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x)))
+    def forward(self, x: Tensor, y: Tensor) -> Tensor:
+        def attn_residual_func(x: Tensor,y: Tensor) -> Tensor:
+            return self.ls1(self.attn(self.norm1_x(x),self.norm1_y(y)))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
 
         if self.training and self.sample_drop_ratio > 0.1:
             # the overhead is compensated only for a drop path rate larger than 0.1
-            x = drop_add_residual_stochastic_depth(
-                x,
+            x = cross_attention_drop_add_residual_stochastic_depth(
+                x,y,
                 residual_func=attn_residual_func,
                 sample_drop_ratio=self.sample_drop_ratio,
             )
@@ -172,10 +173,10 @@ class CrossAttentionBlock(nn.Module):
                 sample_drop_ratio=self.sample_drop_ratio,
             )
         elif self.training and self.sample_drop_ratio > 0.0:
-            x = x + self.drop_path1(attn_residual_func(x))
+            x = x + self.drop_path1(attn_residual_func(x,y))
             x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
         else:
-            x = x + attn_residual_func(x)
+            x = x + attn_residual_func(x,y)
             x = x + ffn_residual_func(x)
         return x
 
@@ -193,6 +194,32 @@ def drop_add_residual_stochastic_depth(
 
     # 2) apply residual_func to get residual
     residual = residual_func(x_subset)
+
+    x_flat = x.flatten(1)
+    residual = residual.flatten(1)
+
+    residual_scale_factor = b / sample_subset_size
+
+    # 3) add the residual
+    x_plus_residual = torch.index_add(x_flat, 0, brange, residual.to(dtype=x.dtype), alpha=residual_scale_factor)
+    return x_plus_residual.view_as(x)
+
+def cross_attention_drop_add_residual_stochastic_depth(
+    x: Tensor, y: Tensor,
+    residual_func: Callable[[Tensor], Tensor],
+    sample_drop_ratio: float = 0.0,
+) -> Tensor:
+    # 1) extract subset using permutation
+    b, n, d = x.shape
+    sample_subset_size = max(int(b * (1 - sample_drop_ratio)), 1)
+    brange = (torch.randperm(b, device=x.device))[:sample_subset_size]
+    x_subset = x[brange]
+    
+    brange = (torch.randperm(b, device=x.device))[:sample_subset_size]
+    y_subset = y[brange]
+
+    # 2) apply residual_func to get residual
+    residual = residual_func(x_subset,y_subset)
 
     x_flat = x.flatten(1)
     residual = residual.flatten(1)

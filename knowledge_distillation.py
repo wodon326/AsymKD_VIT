@@ -16,10 +16,11 @@ from AsymKD.dpt import AsymKD_DepthAnything
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
-from AsymKD_student import AsymKD_Student_DPTHead, AsymKD_Student_Encoder, AsymKD_Student
 
+from AsymKD_student import AsymKD_Student
 from AsymKD_evaluate import *
 import core.AsymKD_datasets as datasets
+from segment_anything import sam_model_registry, SamPredictor
 import gc
 
 import torch.nn.functional as F
@@ -268,92 +269,168 @@ def train(rank, world_size, args):
         model_type = "vit_l"
         segment_anything = sam_model_registry[model_type](checkpoint=checkpoint).to(rank).eval()
         segment_anything_predictor = SamPredictor(segment_anything)
+
         for child in segment_anything.children():
             ImageEncoderViT = child
             break
-        AsymKD_VIT = AsymKD_DepthAnything(ImageEncoderViT = ImageEncoderViT).to(rank)
+        asymkd_moe = AsymKD_DepthAnything(ImageEncoderViT = ImageEncoderViT).to(rank)
+        teacher_model = DDP(asymkd_moe, device_ids=[rank], find_unused_parameters=True)
+        teacher_model.eval()
 
-        model = DDP(AsymKD_VIT, device_ids=[rank], find_unused_parameters=True)
-        #print("Parameter Count: %d" % count_parameters(model))
-        print("AsymKD_VIT Train")
+
+        
+        AsymKD = AsymKD_Student().to(rank)
+        student_model = DDP(AsymKD, device_ids=[rank], find_unused_parameters=True)
+        student_model.train()
+        
+        M = 1000000
+        print("Parameter Count: %dM" % (int(count_parameters(student_model))/M))
+        print("Solution 3 KD")
         train_loader = datasets.fetch_dataloader(args,segment_anything_predictor, rank, world_size)
-        optimizer, scheduler = fetch_optimizer(args, model)
+        optimizer, scheduler = fetch_optimizer(args, student_model)
         total_steps = 0
-        logger = Logger(model, scheduler)
+        logger = Logger(student_model, scheduler)
+        restore_ckpt = 'checkpoints/train_moe_AsymKD.pth'
+        if restore_ckpt is not None:
+            assert restore_ckpt.endswith(".pth")
+            logging.info("Loading checkpoint...")
+            checkpoint = torch.load(restore_ckpt, map_location=torch.device('cuda', rank))
+            teacher_model.load_state_dict(checkpoint, strict=True)
+            logging.info(f"Done loading checkpoint")
 
-        model.train()
         #model.module.freeze_bn() # We keep BatchNorm frozen
 
         validation_frequency = 10000
-
         scaler = GradScaler(enabled=args.mixed_precision)
 
-        should_keep_training = True
+
+
+
+        stored_teacher_features = []
+        stored_depth_images = []
+
         global_batch_num = 0
-        epoch = 0
-        while should_keep_training:
+        for i_batch, data_blob in enumerate(tqdm(train_loader)):
+            
+            optimizer.zero_grad()
+            depth_image, seg_image, flow, valid = [x.cuda() for x in data_blob]
 
-            for i_batch, data_blob in enumerate(tqdm(train_loader)):
-                optimizer.zero_grad()
-                depth_image, seg_image , flow, valid = [x.cuda() for x in data_blob]
-                assert model.training
-                flow_predictions = model(depth_image,seg_image)
-                assert model.training
-                loss, metrics = sequence_loss(flow_predictions, flow, valid)
+            with torch.no_grad():
+                teacher_feature, _ = teacher_model(depth_image, seg_image)
+                stored_teacher_features.append([teach_feat.cpu() for teach_feat in teacher_feature])
+                stored_depth_images.append(depth_image.cpu())
+            
+
+            depth_image_h, depth_image_w = depth_image.shape[-2:]
+            depth_patch_h, depth_patch_w = depth_image_h // 14, depth_image_w // 14
+
+            student_feature = student_model(depth_image,depth_patch_h, depth_patch_w)
+            loss = None
+            for teacher, student in zip(teacher_feature, student_feature):
+                if(loss is not None):
+                    loss += F.mse_loss(student, teacher)
+                else:
+                    loss = F.mse_loss(student, teacher)
+            
+            if rank == 0:
                 logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
-                logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
 
-                # inference visualization in tensorboard while training
-                rgb = depth_image[0].cpu().detach().numpy()
-                rgb = ((rgb - np.min(rgb)) / (np.max(rgb) - np.min(rgb))) * 255
-    
-                gt = flow[0].cpu().detach().numpy()
-                gt = ((gt - np.min(gt)) / (np.max(gt) - np.min(gt))) * 255
-    
-                pred = flow_predictions[0].cpu().detach().numpy()
-                pred = ((pred - np.min(pred)) / (np.max(pred) - np.min(pred))) * 255
-    
-                logger.writer.add_image('RGB', rgb.astype(np.uint8))
-                logger.writer.add_image('GT', gt.astype(np.uint8))
-                logger.writer.add_image('Prediction', pred.astype(np.uint8))
+            global_batch_num += 1
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
+
+            scaler.step(optimizer)
+            scheduler.step()
+            scaler.update()
+
+            if(i_batch%1000==999):
+                for _ in range(9):
+                    for img ,feat in zip(stored_depth_images,stored_teacher_features):
+                        teach_feat = [f.to(rank) for f in feat]
+                        img = img.to(rank)
+                        depth_image_h, depth_image_w = img.shape[-2:]
+                        depth_patch_h, depth_patch_w = depth_image_h // 14, depth_image_w // 14
+
+                        student_feature = student_model(img, depth_patch_h, depth_patch_w)
+
+                        loss = None
+                        for teacher, student in zip(teach_feat, student_feature):
+                            if(loss is not None):
+                                loss += F.mse_loss(student, teacher)
+                            else:
+                                loss = F.mse_loss(student, teacher)
+                        
+                        if rank == 0:
+                            logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
+
+                        global_batch_num += 1
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
+
+                        scaler.step(optimizer)
+                        scheduler.step()
+                        scaler.update()
+                del stored_teacher_features
+                del stored_depth_images
+                stored_depth_images = []
+                stored_teacher_features= []
+                torch.cuda.empty_cache()
+                gc.collect()
+                if rank == 0:
+                    save_path = Path('checkpoints/%d_%s.pth' % (total_steps + 1, args.name))
+                    logging.info(f"Saving file {save_path.absolute()}")
+                    torch.save(student_model.state_dict(), save_path)
+
+            if total_steps%100==0:
+                torch.cuda.empty_cache()
+                gc.collect()
+            total_steps += 1
+
+        for _ in range(9):
+            for img ,feat in zip(stored_depth_images,stored_teacher_features):
+                teach_feat = [f.to(rank) for f in feat]
+                img = img.to(rank)
+                depth_image_h, depth_image_w = img.shape[-2:]
+                depth_patch_h, depth_patch_w = depth_image_h // 14, depth_image_w // 14
+                student_feature = student_model(img,depth_patch_h, depth_patch_w)
+
+                loss = None
+                for teacher, student in zip(teach_feat, student_feature):
+                    if(loss is not None):
+                        loss += F.mse_loss(student, teacher)
+                    else:
+                        loss = F.mse_loss(student, teacher)
+                
+                if rank == 0:
+                    logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
 
                 global_batch_num += 1
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
 
                 scaler.step(optimizer)
                 scheduler.step()
                 scaler.update()
-
-                logger.push(metrics)
-
-                if total_steps % validation_frequency == validation_frequency - 1 and rank == 0:
-                    save_path = Path('checkpoints/%d_%s.pth' % (total_steps + 1, args.name))
-                    logging.info(f"Saving file {save_path.absolute()}")
-                    torch.save(model.state_dict(), save_path)
-
-                if total_steps%100==0:
-                    torch.cuda.empty_cache()
-                    gc.collect()
-
-                total_steps += 1
-
-
-
-                if total_steps > args.num_steps:
-                    should_keep_training = False
-                    break
-            epoch += 1     
-            if len(train_loader) >= 10000:
-                save_path = Path('checkpoints/%d_epoch_%s.pth.gz' % (total_steps + 1, args.name))
-                logging.info(f"Saving file {save_path}")
-                torch.save(model.state_dict(), save_path)
+        del stored_teacher_features
+        del stored_depth_images
+        stored_depth_images = []
+        stored_teacher_features= []
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        if rank == 0:
+            save_path = Path('checkpoints/%d_%s.pth' % (total_steps + 1, args.name))
+            logging.info(f"Saving file {save_path.absolute()}")
+            torch.save(student_model.state_dict(), save_path)
+            
 
         print("FINISHED TRAINING")
         logger.close()
         PATH = 'checkpoints/%s.pth' % args.name
-        torch.save(model.state_dict(), PATH)
+        torch.save(student_model.state_dict(), PATH)
 
         return PATH
     finally:
@@ -361,7 +438,7 @@ def train(rank, world_size, args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--name', default='AsymKD', help="name your experiment")
+    parser.add_argument('--name', default='AsymKD_MOEKD', help="name your experiment")
     parser.add_argument('--restore_ckpt', help="restore checkpoint")
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
 
