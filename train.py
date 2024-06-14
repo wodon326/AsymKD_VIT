@@ -333,6 +333,12 @@ def train(rank, world_size, args):
                     logging.info(f"Saving file {save_path.absolute()}")
                     torch.save(model.state_dict(), save_path)
 
+                if epoch >= 4 and total_steps % 1000 == 999 and rank == 0:
+                    save_path = Path('checkpoints/%d_%s.pth' % (total_steps + 1, args.name))
+                    logging.info(f"Saving file {save_path.absolute()}")
+                    torch.save(model.state_dict(), save_path)
+
+
                 if total_steps%100==0:
                     torch.cuda.empty_cache()
                     gc.collect()
